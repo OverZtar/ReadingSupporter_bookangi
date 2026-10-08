@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Hand Gesture Test</title>
+<style>
+  body { margin:0; font-family:sans-serif; background:#111; color:#eee; }
+  #row { display:flex; gap:16px; margin:16px; flex-wrap:wrap; }
+  #wrap { position:relative; width:640px; height:480px; background:#000; }
+  video, canvas { position:absolute; inset:0; width:640px; height:480px; transform:scaleX(-1); }
+  #cursor { position:fixed; width:18px; height:18px; border-radius:50%; background:#ff4d4d;
+            pointer-events:none; transform:translate(-50%,-50%); display:none; z-index:10; }
+  #side { min-width:340px; }
+  #big { font-size:72px; font-weight:700; line-height:1; }
+  #bar { height:8px; background:#333; border-radius:4px; margin:8px 0 14px; overflow:hidden; }
+  #bar div { height:100%; width:0; background:#4caf50; }
+  #fingers { font-family:monospace; font-size:14px; line-height:1.7; white-space:pre; }
+  .on { color:#7cfc00; } .off { color:#666; }
+  #info { margin:0 16px; font-size:18px; min-height:1.6em; }
+  #guide { position:absolute; left:12px; right:12px; bottom:12px; padding:10px 14px; border-radius:8px;
+           font-size:17px; font-weight:600; display:none; z-index:2; }
+  #guide.block { display:block; background:#e65100e6; color:#fff; }
+  #guide.hint  { display:block; background:#fdd835e0; color:#222; }
+  #log { margin:8px 16px; font-size:14px; color:#9f9; white-space:pre; height:140px; overflow:auto; }
+</style>
+</head>
+<body>
+<div id="row">
+  <div id="wrap"><video id="video" autoplay playsinline></video><canvas id="canvas" width="640" height="480"></canvas><div id="guide"></div></div>
+  <div id="side">
+    <div>펴진 손가락</div>
+    <div id="big">-</div>
+    <div id="bar"><div></div></div>
+    <div id="fingers"></div>
+  </div>
+</div>
+<div id="cursor"></div>
+<div id="info">로딩 중...</div>
+<div id="log"></div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, DrawingUtils } from "./lib/vision_bundle.mjs";
+import { fingersUp, NAMES } from "./fingers.js";
+import { PostureGuard } from "./posture.js";
+
+// ───────── 설정값 ─────────
+const HOLD_MS = 700;   // 같은 개수를 이만큼 유지해야 확정
+const SMOOTH  = 0.35;  // 포인터 부드럽게 (0~1)
+const VOTE_N  = 7;     // 최근 몇 프레임의 다수결로 개수를 정할지 (한두 프레임 튀는 것 무시)
+
+// ───────── 다른 팀원이 받아 쓸 이벤트 ─────────
+// hand:select  e.detail.count  1~5 (펴진 손가락 개수, 어느 손가락이든 상관없음)
+// hand:cancel  주먹(0개)
+// hand:point   e.detail.x, y   검지 하나만 폈을 때 화면 좌표
+// hand:lost    손 사라짐
+// hand:guide   e.detail.level ("block"|"hint"|"ok"), e.detail.msg   자세 안내가 바뀔 때마다
+//              → 뷰어 화면에도 같은 안내를 띄우고 싶으면 이걸 받으면 됨
+const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, { detail }));
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d"), draw = new DrawingUtils(ctx);
+const info = $("info"), logEl = $("log"), cursor = $("cursor");
+const log = (s) => { logEl.textContent = `${new Date().toLocaleTimeString()}  ${s}\n` + logEl.textContent; };
+const fail = (step, e) => { info.textContent = `❌ ${step} 실패: ${e.message || e}`; throw e; };
+
+if (location.protocol === "file:") fail("실행 방식", "파일을 더블클릭하지 말고 python -m http.server 로 열어주세요");
+
+// ───────── 초기화 ─────────
+let vision;
+try { vision = await FilesetResolver.forVisionTasks("./lib/wasm"); }
+catch (e) { fail("① 라이브러리 로딩 (lib 폴더 확인)", e); }
+
+const makeHands = (delegate) => HandLandmarker.createFromOptions(vision, {
+  baseOptions: { modelAssetPath: "./hand_landmarker.task", delegate },
+  runningMode: "VIDEO", numHands: 1,
+  // 기본값 0.5 → 0.6: 추적이 흐트러지면(손가락 점이 엉뚱한 데 붙으면) 손을 처음부터 다시 찾게 함
+  minHandDetectionConfidence: 0.6,
+  minHandPresenceConfidence: 0.6,
+  minTrackingConfidence: 0.6,
+});
+let hands;
+try { hands = await makeHands("GPU"); }
+catch { try { hands = await makeHands("CPU"); } catch (e) { fail("② 모델 로딩 (hand_landmarker.task 확인)", e); } }
+
+try { video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }); }
+catch (e) { fail("③ 웹캠 (권한 허용 / 다른 앱이 카메라 사용 중인지 확인)", e); }
+await new Promise((r) => (video.onloadeddata = r));
+
+// ───────── 상태 ─────────
+let prevUp = {};          // 직전 프레임 손가락 상태 (히스테리시스)
+const votes = [];         // 최근 개수 기록
+let cur = null, since = 0, fired = false;
+let px = null, py = null, handVisible = false;
+const guard = new PostureGuard();
+let lastGuideKey = null;
+
+function showGuide(g) {
+  const el = $("guide");
+  el.className = g.level === "ok" ? "" : g.level;
+  el.textContent = (g.level === "block" ? "✋ " : "💡 ") + g.msg;
+  if (g.key !== lastGuideKey) {
+    lastGuideKey = g.key;
+    emit("hand:guide", { level: g.level, msg: g.msg });
+    if (g.key) log(`안내: ${g.msg}`);
+  }
+}
+
+function majority(arr) {
+  const c = {}; let best = arr[0];
+  for (const v of arr) { c[v] = (c[v] || 0) + 1; if (c[v] > c[best]) best = v; }
+  return best;
+}
+
+function stabilize(count, now) {
+  if (count !== cur) { cur = count; since = now; fired = false; return; }
+  if (fired || now - since < HOLD_MS) return;
+  fired = true;
+  if (count === 0) { emit("hand:cancel"); log("취소 (주먹)"); }
+  else { emit("hand:select", { count }); log(`선택 ${count}`); }
+}
+
+const LABEL = { thumb: "엄지", index: "검지", middle: "중지", ring: "약지", pinky: "새끼" };
+function showFingers(up, m) {
+  $("fingers").innerHTML = NAMES.map((n) => {
+    const t = m.thumb;
+    const v = n === "thumb"
+      ? `옆 ${t.lat.toFixed(2)} 떨어짐 ${t.clear.toFixed(2)} 폭 ${t.width.toFixed(2)} | 3D ${t.side3d.toFixed(2)}`
+      : `길이 ${m[n].reach.toFixed(2)} 일자 ${m[n].line2.toFixed(2)} | 3D ${m[n].straight3d.toFixed(2)}/${m[n].knuckle3d.toFixed(2)}`;
+    return `<span class="${up[n] ? "on" : "off"}">${up[n] ? "■" : "□"} ${LABEL[n]}  ${v}</span>`;
+  }).join("\n");
+}
+
+// ───────── 메인 루프 ─────────
+let lastT = -1;
+function loop() {
+  const now = performance.now();
+  if (video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const res = hands.detectForVideo(video, now);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (res.landmarks.length) {
+      handVisible = true;
+      const lm = res.landmarks[0];        // 화면 좌표 (그리기·커서용)
+      const wl = res.worldLandmarks[0];   // 실제 3D 좌표 (판정용)
+      draw.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, { color: "#0f0", lineWidth: 3 });
+      draw.drawLandmarks(lm, { color: "#f00", radius: 3 });
+
+      const aspect = video.videoWidth / video.videoHeight;
+      const f = fingersUp(wl, lm, prevUp, aspect);
+      prevUp = f.up;
+      votes.push(f.count); if (votes.length > VOTE_N) votes.shift();
+      const count = majority(votes);
+
+      // 자세 점검: 인식을 믿기 어려운 상태면 선택 확정을 막고 안내
+      const hd = (res.handedness || res.handednesses || [])[0]?.[0];
+      const g = guard.update(lm, f, hd ? hd.score : 1, aspect, now);
+      showGuide(g);
+      if (g.blocked) { cur = null; fired = false; }
+      else stabilize(count, now);
+
+      // 검지 하나만 폈을 때 커서
+      const tx = (1 - lm[8].x) * innerWidth, ty = lm[8].y * innerHeight;
+      px = px === null ? tx : px + (tx - px) * SMOOTH;
+      py = py === null ? ty : py + (ty - py) * SMOOTH;
+      if (count === 1 && f.up.index) {
+        cursor.style.display = "block";
+        cursor.style.left = px + "px"; cursor.style.top = py + "px";
+        emit("hand:point", { x: px, y: py });
+      } else cursor.style.display = "none";
+
+      const held = g.blocked ? 0 : Math.min(1, (now - since) / HOLD_MS);
+      $("big").textContent = count === 0 ? "주먹" : count;
+      $("big").style.opacity = g.blocked ? 0.35 : 1;
+      $("bar").firstElementChild.style.width = held * 100 + "%";
+      showFingers(f.up, f.m);
+      $("fingers").innerHTML += `\n\n<span class="off">손 크기 ${g.palm.toFixed(2)}  흔들림 ${g.flips}  확신도 ${g.score.toFixed(2)}</span>`;
+      info.textContent = g.blocked ? "선택 잠시 멈춤 — 안내에 맞춰 손을 바로잡아 주세요"
+                       : fired ? "✔ 확정됨 — 다른 모양으로 바꾸면 다시 선택 가능" : "같은 모양 유지 중…";
+    } else {
+      if (handVisible) { emit("hand:lost"); log("손 사라짐"); }
+      handVisible = false; cur = null; prevUp = {}; votes.length = 0; px = py = null;
+      guard.reset(); showGuide({ key: null, level: "ok", msg: "" });
+      cursor.style.display = "none";
+      $("big").textContent = "-"; $("bar").firstElementChild.style.width = "0";
+      info.textContent = "손이 안 보임";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+info.textContent = "준비 완료 — 손을 보여주세요";
+loop();
+</script>
+</body>
+</html>
